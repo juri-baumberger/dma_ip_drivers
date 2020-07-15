@@ -39,7 +39,7 @@
 
 #define FATAL do { fprintf(stderr, "Error at line %d, file %s (%d) [%s]\n", __LINE__, __FILE__, errno, strerror(errno)); exit(1); } while(0)
 
-#define MAP_SIZE (32*1024UL)
+#define MAP_SIZE (4*1024UL)
 #define MAP_MASK (MAP_SIZE - 1)
 
 int main(int argc, char **argv)
@@ -96,14 +96,16 @@ int main(int argc, char **argv)
 	fflush(stdout);
 
 	/* map one page */
-	map_base = mmap(0, MAP_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	off_t target_page_offset = target & ~MAP_MASK;
+	off_t offset_in_page = target & MAP_MASK;
+	map_base = mmap(0, MAP_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, target_page_offset);
 	if (map_base == (void *)-1)
 		FATAL;
 	printf("Memory mapped at address %p.\n", map_base);
 	fflush(stdout);
 
 	/* calculate the virtual address to be accessed */
-	virt_addr = map_base + target;
+	virt_addr = map_base + offset_in_page;
 	/* read only */
 	if (argc <= 4) {
 		//printf("Read from address %p.\n", virt_addr); 
