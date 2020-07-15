@@ -13,7 +13,9 @@ topdir := $(shell cd $(src)/.. && pwd)
 
 TARGET_MODULE:=xdma
 
+NVIDIA_SRC_DIR := "$(shell find /usr/src/nvidia-* -name nv-p2p.h 2>/dev/null|head -1|xargs dirname 2>/dev/null)"
 EXTRA_CFLAGS := -I$(topdir)/include $(XVC_FLAGS)
+EXTRA_CFLAGS += -I$(NVIDIA_SRC_DIR)
 #EXTRA_CFLAGS += -D__LIBXDMA_DEBUG__
 #EXTRA_CFLAGS += -DINTERNAL_TESTING
 
