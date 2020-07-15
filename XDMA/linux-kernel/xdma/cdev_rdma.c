@@ -29,7 +29,7 @@ static void rdma_p2p_free_callback(void *data)
 
 static int rdma_ioctl_pin_cuda(struct xdma_cdev *xcdev, unsigned long arg)
 {
-	printk(KERN_ALERT "Moo RDMA IOCTL\n");
+	printk(KERN_INFO "RDMA IOCTL PIN CUDA\n");
 	void __user *argp = (void __user *)arg;
 	struct rdma_pin_cuda pin_params;
 	struct rdma_cuda_surface *cusurf;
@@ -53,6 +53,13 @@ static int rdma_ioctl_pin_cuda(struct xdma_cdev *xcdev, unsigned long arg)
 	if (ret < 0) {
 		kfree(cusurf);
 		return ret;
+	}
+	
+	printk(KERN_INFO "CUDA PIN PageTable Entries %d, Size %d, physical addresses:\n", cusurf->page_table->entries, cusurf->page_table->page_size);
+	int numEntries = cusurf->page_table->entries;
+	if (numEntries > 0)
+	{
+	    printk(KERN_INFO "Pinned memory starting at physical address 0x%llx ", cusurf->page_table->pages[0]->physical_address);
 	}
 	
 	return 0;
