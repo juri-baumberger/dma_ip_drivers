@@ -34,8 +34,8 @@
 #include <sys/types.h>
 #include "../../xdma/cdev_rdma.h"
 
-#define SURFACE_W	1024
-#define SURFACE_H	1024
+#define SURFACE_W	3840
+#define SURFACE_H	2160
 #define SURFACE_SIZE	(SURFACE_W * SURFACE_H)
 
 #define OFFSET(x, y)	(((y) * SURFACE_W) + x)
@@ -140,6 +140,9 @@ int main(int argc, char **argv)
 		fprintf(stderr, "cudaDeviceSynchronize() failed: %d\n", ce);
 		return 1;
 	}
+	
+	// Breakout here, as SGDMA not implemented
+	return 1;
 
 	dma_params.src = pin_params_src.handle;
 	dma_params.dst = pin_params_dst.handle;
