@@ -95,6 +95,7 @@ struct xdma_pci_dev {
 	struct xdma_cdev bypass_cdev_base;
 
 	struct xdma_cdev xvc_cdev;
+	struct xdma_cdev rdma_cdev;
 
 	void *data;
 };

@@ -35,6 +35,7 @@ enum cdev_type {
 	CHAR_BYPASS_H2C,
 	CHAR_BYPASS_C2H,
 	CHAR_BYPASS,
+	CHAR_RDMA
 };
 
 static const char * const devnode_names[] = {
@@ -47,6 +48,7 @@ static const char * const devnode_names[] = {
 	XDMA_NODE_NAME "%d_bypass_h2c_%d",
 	XDMA_NODE_NAME "%d_bypass_c2h_%d",
 	XDMA_NODE_NAME "%d_bypass",
+	XDMA_NODE_NAME "%d_rdma",
 };
 
 enum xpdev_flags_bits {
@@ -56,6 +58,7 @@ enum xpdev_flags_bits {
 	XDF_CDEV_EVENT,
 	XDF_CDEV_SG,
 	XDF_CDEV_BYPASS,
+	XDF_CDEV_RDMA,
 };
 
 static inline void xpdev_flag_set(struct xdma_pci_dev *xpdev,
@@ -113,6 +116,7 @@ static int config_kobject(struct xdma_cdev *xcdev, enum cdev_type type)
 	case CHAR_USER:
 	case CHAR_CTRL:
 	case CHAR_XVC:
+	case CHAR_RDMA:
 		rv = kobject_set_name(&xcdev->cdev.kobj, devnode_names[type],
 			xdev->idx);
 		break;
@@ -326,6 +330,11 @@ static int create_xcdev(struct xdma_pci_dev *xpdev, struct xdma_cdev *xcdev,
 		minor = type;
 		cdev_xvc_init(xcdev);
 		break;
+	case CHAR_RDMA:
+		/* minor number is type index for non-SGDMA interfaces */
+		minor = type;
+		cdev_rdma_init(xcdev);
+		break;
 	case CHAR_XDMA_H2C:
 		minor = 32 + engine->channel;
 		cdev_sgdma_init(xcdev);
@@ -458,6 +467,13 @@ void xpdev_destroy_interfaces(struct xdma_pci_dev *xpdev)
 		if (rv < 0)
 			pr_err("Failed to destroy base cdev\n");
 	}
+	
+	if (xpdev_flag_test(xpdev, XDF_CDEV_RDMA)) {
+		rv = destroy_xcdev(&xpdev->rdma_cdev);
+		if (rv < 0)
+			pr_err("Failed to destroy rdma cdev %d error 0x%x\n",
+				i, rv);
+	}
 
 	if (xpdev->major)
 		unregister_chrdev_region(
@@ -583,6 +599,15 @@ int xpdev_create_interfaces(struct xdma_pci_dev *xpdev)
 		}
 		xpdev_flag_set(xpdev, XDF_CDEV_XVC);
 	}
+	
+	/* init rdma character device */
+	rv = create_xcdev(xpdev, &xpdev->rdma_cdev, -1,
+			NULL, CHAR_RDMA);
+	if (rv < 0) {
+		pr_err("create char rdma failed, %d.\n", rv);
+		goto fail;
+	}
+	xpdev_flag_set(xpdev, XDF_CDEV_RDMA);
 
 #ifdef __XDMA_SYSFS__
 	/* sys file */
