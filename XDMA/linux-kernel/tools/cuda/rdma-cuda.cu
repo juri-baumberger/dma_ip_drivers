@@ -20,7 +20,9 @@
  * DEALINGS IN THE SOFTWARE.
  */
 
+#define GL_GLEXT_PROTOTYPES
 #include <cuda.h>
+#include <cuda_gl_interop.h>
 #include <cuda_runtime_api.h>
 #include <errno.h>
 #include <stdio.h>
@@ -33,6 +35,10 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include "../../xdma/cdev_rdma.h"
+
+#include <GL/gl.h>
+#include <GL/glext.h>
+#include <GL/glut.h>
 
 #define SURFACE_W	3840
 #define SURFACE_H	2160
@@ -49,11 +55,72 @@ extern "C" __global__ void fill_surface(uint32_t *output, uint32_t xor_val)
 	output[OFFSET(pos_x, pos_y)] = DATA(pos_x, pos_y) ^ xor_val;
 }
 
+GLuint pbo = 0;
+GLuint tex = 0;
+struct cudaGraphicsResource *cuda_pbo_resource;
+uint32_t *src_d, *dst_d;
+
+void drawTexture()
+{
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, SURFACE_W, SURFACE_H, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+	glEnable(GL_TEXTURE_2D);
+	glBegin(GL_QUADS);
+	glTexCoord2f(0.0f, 0.0f); glVertex2f(0, 0);
+	glTexCoord2f(0.0f, 1.0f); glVertex2f(0, SURFACE_H);
+	glTexCoord2f(1.0f, 1.0f); glVertex2f(SURFACE_W, SURFACE_H);
+	glTexCoord2f(1.0f, 0.0f); glVertex2f(SURFACE_W, 0);
+	glEnd();
+	glDisable(GL_TEXTURE_2D);
+}
+
+void render()
+{
+	cudaGraphicsMapResources(1, &cuda_pbo_resource, 0);
+	uchar4 *d_out = 0;
+	size_t size = 0;
+	cudaGraphicsResourceGetMappedPointer((void **)&d_out, &size, cuda_pbo_resource);
+	cudaMemcpy(d_out, src_d, SURFACE_SIZE * 4, cudaMemcpyDeviceToDevice);
+	cudaGraphicsUnmapResources(1, &cuda_pbo_resource, 0);
+}
+
+void display()
+{
+	render();
+	drawTexture();
+	glutSwapBuffers();
+	glutPostRedisplay();
+}
+
+void initOpenGL(int argc, char **argv)
+{
+	glutInit(&argc, argv);
+	glutInitDisplayMode(GLUT_RGBA | GLUT_DOUBLE);
+	glutInitWindowSize(1920, 1080);
+	glutInitWindowPosition(200, 200);
+	glutCreateWindow("Title");
+	glutDisplayFunc(display);
+	gluOrtho2D(0, SURFACE_W, SURFACE_H, 0);
+}
+
+void initPixelBuffer()
+{
+	// PBO are a "source" of a texture, its buffer data can be "unpacked" to texture.
+	glGenBuffers(1, &pbo);
+	glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo);
+	glBufferData(GL_PIXEL_UNPACK_BUFFER, SURFACE_SIZE * 4, NULL, GL_STREAM_DRAW);
+	
+	glGenTextures(1, &tex);
+	glBindTexture(GL_TEXTURE_2D, tex);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+	
+	cudaGraphicsGLRegisterBuffer(&cuda_pbo_resource, pbo, cudaGraphicsRegisterFlagsWriteDiscard);
+}
+
 int main(int argc, char **argv)
 {
 	cudaError_t ce;
 	CUresult cr;
-	uint32_t *src_d, *dst_d, *dst_cpu;
+	uint32_t *dst_cpu;
 	uint32_t y, x;
 	int fd, ret;
 	unsigned int flag = 1;
@@ -65,6 +132,9 @@ int main(int argc, char **argv)
 		fprintf(stderr, "usage: rdma-cuda\n");
 		return 1;
 	}
+	
+	initOpenGL(argc, argv);
+	initPixelBuffer();
 
 	fd = open("/dev/xdma0_rdma", O_RDWR);
 	if (fd < 0) {
@@ -142,6 +212,7 @@ int main(int argc, char **argv)
 	}
 	
 	// Breakout here, as SGDMA not implemented
+	glutMainLoop();
 	return 1;
 
 	dma_params.src = pin_params_src.handle;

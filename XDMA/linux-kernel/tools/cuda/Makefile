@@ -44,7 +44,7 @@ TARGETS += rdma-cuda
 default: $(TARGETS)
 
 %: %.cu Makefile
-	$(NVCC) $(addprefix -Xcompiler ,$(CFLAGS)) -o $@ $< -l cuda
+	$(NVCC) $(addprefix -Xcompiler ,$(CFLAGS)) -o $@ $< -lcuda -lGL -lGLU -lglut
 
 clean:
 	rm -f $(TARGETS)
