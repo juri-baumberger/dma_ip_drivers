@@ -44,8 +44,17 @@
 #define SURFACE_H	2160
 #define SURFACE_SIZE	(SURFACE_W * SURFACE_H)
 
+#define INPUT_WIDTH_BYTES ((SURFACE_W * 20)/8)
+#define INPUT_STRIDE_BYTES 0x4000
+#define INPUT_BYTES_PER_SAMPLE 5
+
 #define OFFSET(x, y)	(((y) * SURFACE_W) + x)
 #define DATA(x, y)	(((y & 0xffff) << 16) | ((x) & 0xffff))
+
+inline __device__ __host__ float clamp(float f, float a, float b)
+{
+    return fmaxf(a, fminf(f, b));
+}
 
 extern "C" __global__ void fill_surface(uint32_t *output, uint32_t xor_val)
 {
@@ -53,6 +62,62 @@ extern "C" __global__ void fill_surface(uint32_t *output, uint32_t xor_val)
 	unsigned int pos_y = (blockIdx.y * blockDim.y) + threadIdx.y;
 
 	output[OFFSET(pos_x, pos_y)] = DATA(pos_x, pos_y) ^ xor_val;
+}
+
+extern "C" __global__ void convertYuv10ToRGBA(unsigned char *input, unsigned char *output, unsigned int width, unsigned int stride)
+{
+	unsigned int orig_pos_x = (blockIdx.x * blockDim.x) + threadIdx.x;
+	unsigned int pos_x = ((blockIdx.x * blockDim.x) + threadIdx.x) * INPUT_BYTES_PER_SAMPLE;
+	unsigned int pos_y = (blockIdx.y * blockDim.y) + threadIdx.y;
+	
+	if (pos_x > width)
+	{
+	    return;
+	} 
+	
+	// YUV 10bit is 20bit per pixel. We take 2 samples, so 40bit = 5 bytes worth of data, and output 2 RGBA samples, so 64 bit = 8 bytes of data
+	unsigned int offset = pos_x + pos_y * stride;
+	const unsigned char inputPx0 = input[offset];
+	const unsigned char inputPx1 = input[offset+1];
+	const unsigned char inputPx2 = input[offset+2];
+	const unsigned char inputPx3 = input[offset+3];
+	const unsigned char inputPx4 = input[offset+4];
+	
+	float u = 0;//inputPx0 + (inputPx1 & 0x03) * 256.0f;
+	float y0 = (inputPx1 & 0x3F) / 4.0f + (inputPx2 & 0x0F) * 64.0f;
+	float v = 0;//(inputPx2 & 0xF0) / 16.0f + (inputPx3 & 0x3F) * 16.0f;
+	float y1 = (inputPx3 & 0xC0) / 64.0f +  inputPx4 * 4.0f;
+	
+	const float4 px0 = make_float4( y0 + 1.140f * v,
+					 y0 - 0.395f * u - 0.581f * v,
+					 y0 + 2.032f * u, 255.0f );
+
+	const float4 px1 = make_float4( y1 + 1.140f * v,
+					 y1 - 0.395f * u - 0.581f * v,
+					 y1 + 2.032f * u, 255.0f );
+	
+	const uchar4 rgb1 = make_uchar4( 
+				    	clamp(px0.x/4.0f, 0.0f, 255.0f),
+				    	clamp(px0.y/4.0f, 0.0f, 255.0f),
+		    			clamp(px0.z/4.0f, 0.0f, 255.0f),
+					255.0f );
+	const uchar4 rgb2 = make_uchar4( 
+				    	clamp(px1.x/4.0f, 0.0f, 255.0f),
+				    	clamp(px1.y/4.0f, 0.0f, 255.0f),
+		    			clamp(px1.z/4.0f, 0.0f, 255.0f),
+					255.0f );
+						
+	unsigned int outputStride = SURFACE_W * 4;	
+	unsigned int outputXOffset = (orig_pos_x * 8);
+	unsigned int outputOffset = outputXOffset + pos_y * outputStride;				
+	output[outputOffset] = rgb1.x;
+	output[outputOffset+1] = rgb1.y;
+	output[outputOffset+2] = rgb1.z;
+	output[outputOffset+3] = rgb1.w;
+	output[outputOffset+4] = rgb2.x;
+	output[outputOffset+5] = rgb2.y;
+	output[outputOffset+6] = rgb2.z;
+	output[outputOffset+7] = rgb2.w;
 }
 
 GLuint pbo = 0;
@@ -79,7 +144,12 @@ void render()
 	uchar4 *d_out = 0;
 	size_t size = 0;
 	cudaGraphicsResourceGetMappedPointer((void **)&d_out, &size, cuda_pbo_resource);
-	cudaMemcpy(d_out, src_d, SURFACE_SIZE * 4, cudaMemcpyDeviceToDevice);
+	dim3 dimGrid(INPUT_WIDTH_BYTES / (INPUT_BYTES_PER_SAMPLE * 16), SURFACE_H / 16);
+	dim3 dimBlock(16, 16);
+	convertYuv10ToRGBA<<<dimGrid, dimBlock>>>(reinterpret_cast<unsigned char*>(src_d), reinterpret_cast<unsigned char*>(d_out), INPUT_WIDTH_BYTES, INPUT_STRIDE_BYTES);
+	cudaDeviceSynchronize();
+	//cudaMemcpy(d_out, src_d, SURFACE_SIZE * 4, cudaMemcpyDeviceToDevice);
+	
 	cudaGraphicsUnmapResources(1, &cuda_pbo_resource, 0);
 }
 
@@ -112,6 +182,9 @@ void initPixelBuffer()
 	glGenTextures(1, &tex);
 	glBindTexture(GL_TEXTURE_2D, tex);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_BORDER);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_BORDER);
 	
 	cudaGraphicsGLRegisterBuffer(&cuda_pbo_resource, pbo, cudaGraphicsRegisterFlagsWriteDiscard);
 }
@@ -136,7 +209,7 @@ int main(int argc, char **argv)
 	initOpenGL(argc, argv);
 	initPixelBuffer();
 
-	fd = open("/dev/xdma0_rdma", O_RDWR);
+	fd = open("/dev/xdma1_rdma", O_RDWR);
 	if (fd < 0) {
 		perror("open() failed");
 		return 1;
