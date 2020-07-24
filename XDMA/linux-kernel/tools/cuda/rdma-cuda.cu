@@ -56,6 +56,12 @@ inline __device__ __host__ float clamp(float f, float a, float b)
     return fmaxf(a, fminf(f, b));
 }
 
+// round up n/m
+inline int iDivUp(int n, int m)
+{
+    return (n + m - 1) / m;
+}
+
 extern "C" __global__ void fill_surface(uint32_t *output, uint32_t xor_val)
 {
 	unsigned int pos_x = (blockIdx.x * blockDim.x) + threadIdx.x;
@@ -70,23 +76,23 @@ extern "C" __global__ void convertYuv10ToRGBA(unsigned char *input, unsigned cha
 	unsigned int pos_x = ((blockIdx.x * blockDim.x) + threadIdx.x) * INPUT_BYTES_PER_SAMPLE;
 	unsigned int pos_y = (blockIdx.y * blockDim.y) + threadIdx.y;
 	
-	if (pos_x > width)
-	{
-	    return;
-	} 
-	
 	// YUV 10bit is 20bit per pixel. We take 2 samples, so 40bit = 5 bytes worth of data, and output 2 RGBA samples, so 64 bit = 8 bytes of data
-	unsigned int offset = pos_x + pos_y * stride;
-	const unsigned char inputPx0 = input[offset];
+	// Pixels are shifted in batches of 512bit = 64 bytes, so the first bytes will the MSBs of that batch
+	const unsigned int BatchSize = 64;
+	unsigned int batchIndex = pos_x % BatchSize;
+	unsigned int nextBatchOffset = ((pos_x / BatchSize) + 1) * BatchSize;
+	int xOffset = (nextBatchOffset-INPUT_BYTES_PER_SAMPLE) - batchIndex;
+	int offset = xOffset + pos_y * stride;
+	const unsigned char inputPx0 = input[offset+0];
 	const unsigned char inputPx1 = input[offset+1];
 	const unsigned char inputPx2 = input[offset+2];
 	const unsigned char inputPx3 = input[offset+3];
 	const unsigned char inputPx4 = input[offset+4];
 	
-	float u = 0;//inputPx0 + (inputPx1 & 0x03) * 256.0f;
-	float y0 = (inputPx1 & 0x3F) / 4.0f + (inputPx2 & 0x0F) * 64.0f;
-	float v = 0;//(inputPx2 & 0xF0) / 16.0f + (inputPx3 & 0x3F) * 16.0f;
-	float y1 = (inputPx3 & 0xC0) / 64.0f +  inputPx4 * 4.0f;
+	float y0 = inputPx0 + (inputPx1 & 0x03) * 256.0f;
+	float u = (inputPx1 & 0xFC) / 4.0f + (inputPx2 & 0x0F) * 64.0f;
+	float y1 = (inputPx2 & 0xF0) / 16.0f + (inputPx3 & 0x3F) * 16.0f;
+	float v = (inputPx3 & 0xC0) / 64.0f +  inputPx4 * 4.0f;
 	
 	const float4 px0 = make_float4( y0 + 1.140f * v,
 					 y0 - 0.395f * u - 0.581f * v,
@@ -96,7 +102,7 @@ extern "C" __global__ void convertYuv10ToRGBA(unsigned char *input, unsigned cha
 					 y1 - 0.395f * u - 0.581f * v,
 					 y1 + 2.032f * u, 255.0f );
 	
-	const uchar4 rgb1 = make_uchar4( 
+	const uchar4 rgb1 = make_uchar4(
 				    	clamp(px0.x/4.0f, 0.0f, 255.0f),
 				    	clamp(px0.y/4.0f, 0.0f, 255.0f),
 		    			clamp(px0.z/4.0f, 0.0f, 255.0f),
@@ -144,8 +150,8 @@ void render()
 	uchar4 *d_out = 0;
 	size_t size = 0;
 	cudaGraphicsResourceGetMappedPointer((void **)&d_out, &size, cuda_pbo_resource);
-	dim3 dimGrid(INPUT_WIDTH_BYTES / (INPUT_BYTES_PER_SAMPLE * 16), SURFACE_H / 16);
 	dim3 dimBlock(16, 16);
+	dim3 dimGrid(iDivUp(INPUT_WIDTH_BYTES, INPUT_BYTES_PER_SAMPLE * dimBlock.x), iDivUp(SURFACE_H, dimBlock.y));
 	convertYuv10ToRGBA<<<dimGrid, dimBlock>>>(reinterpret_cast<unsigned char*>(src_d), reinterpret_cast<unsigned char*>(d_out), INPUT_WIDTH_BYTES, INPUT_STRIDE_BYTES);
 	cudaDeviceSynchronize();
 	//cudaMemcpy(d_out, src_d, SURFACE_SIZE * 4, cudaMemcpyDeviceToDevice);
@@ -161,14 +167,23 @@ void display()
 	glutPostRedisplay();
 }
 
+void onKeyboardPress(unsigned char key, int x, int y)
+{
+	if (key == 'p')
+	{
+	    printf("onKeyboardPress %d\n", key);
+	}
+}
+
 void initOpenGL(int argc, char **argv)
 {
 	glutInit(&argc, argv);
 	glutInitDisplayMode(GLUT_RGBA | GLUT_DOUBLE);
-	glutInitWindowSize(1920, 1080);
-	glutInitWindowPosition(200, 200);
+	glutInitWindowSize(2160, 2160);
+	glutInitWindowPosition(100, 100);
 	glutCreateWindow("Title");
 	glutDisplayFunc(display);
+	glutKeyboardFunc(onKeyboardPress);
 	gluOrtho2D(0, SURFACE_W, SURFACE_H, 0);
 }
 
@@ -208,7 +223,7 @@ int main(int argc, char **argv)
 	
 	initOpenGL(argc, argv);
 	initPixelBuffer();
-
+	
 	fd = open("/dev/xdma1_rdma", O_RDWR);
 	if (fd < 0) {
 		perror("open() failed");
