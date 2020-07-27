@@ -154,7 +154,7 @@ void render()
 	dim3 dimGrid(iDivUp(INPUT_WIDTH_BYTES, INPUT_BYTES_PER_SAMPLE * dimBlock.x), iDivUp(SURFACE_H, dimBlock.y));
 	convertYuv10ToRGBA<<<dimGrid, dimBlock>>>(reinterpret_cast<unsigned char*>(src_d), reinterpret_cast<unsigned char*>(d_out), INPUT_WIDTH_BYTES, INPUT_STRIDE_BYTES);
 	cudaDeviceSynchronize();
-	//cudaMemcpy(d_out, src_d, SURFACE_SIZE * 4, cudaMemcpyDeviceToDevice);
+	cudaMemcpy(dst_d, src_d, SURFACE_SIZE * 4, cudaMemcpyDeviceToDevice);
 	
 	cudaGraphicsUnmapResources(1, &cuda_pbo_resource, 0);
 }
