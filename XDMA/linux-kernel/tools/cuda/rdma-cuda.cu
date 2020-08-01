@@ -89,10 +89,20 @@ extern "C" __global__ void convertYuv10ToRGBA(unsigned char *input, unsigned cha
 	const unsigned char inputPx3 = input[offset+3];
 	const unsigned char inputPx4 = input[offset+4];
 	
-	float y0 = inputPx0 + (inputPx1 & 0x03) * 256.0f;
-	float u = (inputPx1 & 0xFC) / 4.0f + (inputPx2 & 0x0F) * 64.0f;
-	float y1 = (inputPx2 & 0xF0) / 16.0f + (inputPx3 & 0x3F) * 16.0f;
-	float v = (inputPx3 & 0xC0) / 64.0f +  inputPx4 * 4.0f;
+	int px0Lsb = inputPx0;
+	int px1Lsb = (inputPx1 & 0xFC) >> 2;
+	int px2Lsb = (inputPx2 & 0xF0) >> 4;
+	int px3Lsb = (inputPx3 & 0xC0) >> 6;
+	
+	int px0Msb = (inputPx1 & 0x03) << 8;
+	int px1Msb = (inputPx2 & 0x0F) << 6;
+	int px2Msb = (inputPx3 & 0x3F) << 4;
+	int px3Msb = inputPx4 << 2;
+	
+	int y0 = px0Lsb + px0Msb;
+	int u = px1Lsb + px1Msb;
+	float y1 = px2Lsb + px2Msb;
+	float v = px3Lsb + px3Msb;
 	
 	const float4 px0 = make_float4( y0 + 1.140f * v,
 					 y0 - 0.395f * u - 0.581f * v,
@@ -229,7 +239,7 @@ int main(int argc, char **argv)
 		perror("open() failed");
 		return 1;
 	}
-
+	
 #ifdef NV_BUILD_DGPU
 	ce = cudaMalloc(&src_d, SURFACE_SIZE * sizeof(*src_d));
 #else
