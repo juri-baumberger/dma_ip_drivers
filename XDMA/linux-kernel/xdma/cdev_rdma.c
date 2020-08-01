@@ -59,7 +59,7 @@ static int rdma_ioctl_pin_cuda(struct xdma_cdev *xcdev, unsigned long arg)
 	int numEntries = cusurf->page_table->entries;
 	if (numEntries > 0)
 	{
-	    printk(KERN_INFO "Pinned memory starting at physical address 0x%llx ", cusurf->page_table->pages[0]->physical_address);
+	    printk(KERN_INFO "Pinned memory starting at physical address 0x%llx \n", cusurf->page_table->pages[0]->physical_address);
 	}
 	
 	return 0;
@@ -94,5 +94,9 @@ static const struct file_operations ctrl_fops = {
 
 void cdev_rdma_init(struct xdma_cdev *xcdev)
 {
+	int result;
+	
 	cdev_init(&xcdev->cdev, &ctrl_fops);
+	result = pcie_set_readrq(xcdev->xpdev->pdev, 1024);
+	printk(KERN_INFO "Set XDMA PCI max read to 1024. Res %d\n", result);
 }
