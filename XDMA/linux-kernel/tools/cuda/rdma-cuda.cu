@@ -36,6 +36,8 @@
 #include <sys/types.h>
 #include "../../xdma/cdev_rdma.h"
 
+#include <sys/mman.h>
+
 #include <GL/gl.h>
 #include <GL/glext.h>
 #include <GL/glut.h>
@@ -50,6 +52,8 @@
 
 #define OFFSET(x, y)	(((y) * SURFACE_W) + x)
 #define DATA(x, y)	(((y & 0xffff) << 16) | ((x) & 0xffff))
+
+#define MAP_SIZE (4096)
 
 inline __device__ __host__ float clamp(float f, float a, float b)
 {
@@ -140,6 +144,7 @@ GLuint pbo = 0;
 GLuint tex = 0;
 struct cudaGraphicsResource *cuda_pbo_resource;
 uint32_t *src_d, *dst_d;
+void *map_base;
 
 void drawTexture()
 {
@@ -239,6 +244,22 @@ int main(int argc, char **argv)
 		perror("open() failed");
 		return 1;
 	}
+	
+	int fd_xdma;
+	off_t target_page_offset = 0x0;
+	if ((fd_xdma = open("/dev/xdma1_user", O_RDWR | O_SYNC)) == -1)
+	{
+		fprintf(stderr, "Error opening device\n");
+	}
+	
+	map_base = mmap(0, MAP_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd_xdma, target_page_offset);
+	if (map_base == (void *)-1)
+	{
+		fprintf(stderr, "Error mapping device\n");
+	}
+	
+	cudaError_t test = cudaHostRegister(map_base, MAP_SIZE, cudaHostRegisterIoMemory);
+	fprintf(stderr, "cudaHostRegister: %s\n", cudaGetErrorString(test));
 	
 #ifdef NV_BUILD_DGPU
 	ce = cudaMalloc(&src_d, SURFACE_SIZE * sizeof(*src_d));
