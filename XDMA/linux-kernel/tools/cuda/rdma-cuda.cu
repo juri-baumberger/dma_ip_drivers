@@ -37,6 +37,7 @@
 #include "../../xdma/cdev_rdma.h"
 
 #include <sys/mman.h>
+#include <thread>
 
 #include <GL/gl.h>
 #include <GL/glext.h>
@@ -44,16 +45,23 @@
 
 #define SURFACE_W	3840
 #define SURFACE_H	2160
-#define SURFACE_SIZE	(SURFACE_W * SURFACE_H)
+// Graphics buffer is 4K 32 bit ARGB
+#define GRAPHICS_W	3840
+#define GRAPHICS_H	2160
+#define GRAPHICS_BUFFER_SIZE (GRAPHICS_W * GRAPHICS_H * 4)
 
-#define INPUT_WIDTH_BYTES ((SURFACE_W * 20)/8)
-#define INPUT_STRIDE_BYTES 0x4000
+// Incoming and outgoing video stream is 4K 20bit YCbCr. Line content is 3840 pixel wide, at 20 / 8 bytes per pixel.
+// Each line has padding until we take full line stride of 0x4000 bytes.
+#define STREAM_CONTENT_WIDTH_BYTES ((SURFACE_W * 20)/8)
+#define STREAM_STRIDE_BYTES 0x4000
+#define STREAM_SIZE	(STREAM_STRIDE_BYTES * SURFACE_H)
 #define INPUT_BYTES_PER_SAMPLE 5
 
 #define OFFSET(x, y)	(((y) * SURFACE_W) + x)
 #define DATA(x, y)	(((y & 0xffff) << 16) | ((x) & 0xffff))
 
 #define MAP_SIZE (4096)
+#define NUM_SLICES (8)
 
 inline __device__ __host__ float clamp(float f, float a, float b)
 {
@@ -74,7 +82,7 @@ extern "C" __global__ void fill_surface(uint32_t *output, uint32_t xor_val)
 	output[OFFSET(pos_x, pos_y)] = DATA(pos_x, pos_y) ^ xor_val;
 }
 
-extern "C" __global__ void convertYuv10ToRGBA(unsigned char *input, unsigned char *output, unsigned int width, unsigned int stride)
+extern "C" __global__ void convertYuv10ToRGBA(unsigned char *input, unsigned char *output, unsigned int stride)
 {
 	unsigned int orig_pos_x = (blockIdx.x * blockDim.x) + threadIdx.x;
 	unsigned int pos_x = ((blockIdx.x * blockDim.x) + threadIdx.x) * INPUT_BYTES_PER_SAMPLE;
@@ -86,6 +94,7 @@ extern "C" __global__ void convertYuv10ToRGBA(unsigned char *input, unsigned cha
 	unsigned int batchIndex = pos_x % BatchSize;
 	unsigned int nextBatchOffset = ((pos_x / BatchSize) + 1) * BatchSize;
 	int xOffset = (nextBatchOffset-INPUT_BYTES_PER_SAMPLE) - batchIndex;
+	if (xOffset < 0) { xOffset = 0; }
 	int offset = xOffset + pos_y * stride;
 	const unsigned char inputPx0 = input[offset+0];
 	const unsigned char inputPx1 = input[offset+1];
@@ -127,7 +136,7 @@ extern "C" __global__ void convertYuv10ToRGBA(unsigned char *input, unsigned cha
 		    			clamp(px1.z/4.0f, 0.0f, 255.0f),
 					255.0f );
 						
-	unsigned int outputStride = SURFACE_W * 4;	
+	unsigned int outputStride = GRAPHICS_W * 4;	
 	unsigned int outputXOffset = (orig_pos_x * 8);
 	unsigned int outputOffset = outputXOffset + pos_y * outputStride;				
 	output[outputOffset] = rgb1.x;
@@ -148,13 +157,13 @@ void *map_base;
 
 void drawTexture()
 {
-	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, SURFACE_W, SURFACE_H, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, GRAPHICS_W, GRAPHICS_H, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
 	glEnable(GL_TEXTURE_2D);
 	glBegin(GL_QUADS);
 	glTexCoord2f(0.0f, 0.0f); glVertex2f(0, 0);
-	glTexCoord2f(0.0f, 1.0f); glVertex2f(0, SURFACE_H);
-	glTexCoord2f(1.0f, 1.0f); glVertex2f(SURFACE_W, SURFACE_H);
-	glTexCoord2f(1.0f, 0.0f); glVertex2f(SURFACE_W, 0);
+	glTexCoord2f(0.0f, 1.0f); glVertex2f(0, GRAPHICS_H);
+	glTexCoord2f(1.0f, 1.0f); glVertex2f(GRAPHICS_W, GRAPHICS_H);
+	glTexCoord2f(1.0f, 0.0f); glVertex2f(GRAPHICS_W, 0);
 	glEnd();
 	glDisable(GL_TEXTURE_2D);
 }
@@ -166,10 +175,8 @@ void render()
 	size_t size = 0;
 	cudaGraphicsResourceGetMappedPointer((void **)&d_out, &size, cuda_pbo_resource);
 	dim3 dimBlock(16, 16);
-	dim3 dimGrid(iDivUp(INPUT_WIDTH_BYTES, INPUT_BYTES_PER_SAMPLE * dimBlock.x), iDivUp(SURFACE_H, dimBlock.y));
-	convertYuv10ToRGBA<<<dimGrid, dimBlock>>>(reinterpret_cast<unsigned char*>(src_d), reinterpret_cast<unsigned char*>(d_out), INPUT_WIDTH_BYTES, INPUT_STRIDE_BYTES);
-	cudaDeviceSynchronize();
-	cudaMemcpy(dst_d, src_d, SURFACE_SIZE * 4, cudaMemcpyDeviceToDevice);
+	dim3 dimGrid(iDivUp(STREAM_CONTENT_WIDTH_BYTES, INPUT_BYTES_PER_SAMPLE * dimBlock.x), iDivUp(SURFACE_H, dimBlock.y));
+	convertYuv10ToRGBA<<<dimGrid, dimBlock>>>(reinterpret_cast<unsigned char*>(src_d), reinterpret_cast<unsigned char*>(d_out), STREAM_STRIDE_BYTES);
 	
 	cudaGraphicsUnmapResources(1, &cuda_pbo_resource, 0);
 }
@@ -190,6 +197,67 @@ void onKeyboardPress(unsigned char key, int x, int y)
 	}
 }
 
+static int lastFrameSliceValue = 0;
+void scheduleLoop()
+{
+	cudaSetDevice(0);
+	
+	CUdeviceptr baseBarAddr;
+	CUresult cr = cuMemHostGetDevicePointer(&baseBarAddr, map_base, 0);
+	if (cr != CUDA_SUCCESS) 
+	{
+		printf("Err %d", cr);
+	}
+	CUdeviceptr addr = baseBarAddr + 0x60;
+	uint32_t sliceSizeInBytes = STREAM_SIZE / NUM_SLICES;
+	uint32_t sliceSizeInWords = sliceSizeInBytes / sizeof(uint32_t);
+		
+	while (true)
+	{	
+		bool scheduleWork = false;
+		int frameSliceValue = *((uint32_t*)addr);
+		
+		if (lastFrameSliceValue > frameSliceValue)
+		{
+			if (frameSliceValue != 0)
+			{
+				printf("Missed frame start: %0x, %0x\n", lastFrameSliceValue, frameSliceValue);
+			}	
+			scheduleWork = true;
+		}
+		lastFrameSliceValue = frameSliceValue;
+		
+		if (scheduleWork)
+		{
+			cuStreamWaitValue32(NULL, addr, 0x01, CU_STREAM_WAIT_VALUE_EQ);
+			cudaMemcpyAsync(dst_d + 0 * sliceSizeInWords, src_d + 0 * sliceSizeInWords, sliceSizeInBytes, cudaMemcpyDeviceToDevice);
+			
+			cuStreamWaitValue32(NULL, addr, 0x03, CU_STREAM_WAIT_VALUE_EQ);
+			cudaMemcpyAsync(dst_d + 1 * sliceSizeInWords, src_d + 1 * sliceSizeInWords, sliceSizeInBytes, cudaMemcpyDeviceToDevice);
+			
+			cuStreamWaitValue32(NULL, addr, 0x07, CU_STREAM_WAIT_VALUE_EQ);
+			cudaMemcpyAsync(dst_d + 2 * sliceSizeInWords, src_d + 2 * sliceSizeInWords, sliceSizeInBytes, cudaMemcpyDeviceToDevice);
+			
+			cuStreamWaitValue32(NULL, addr, 0x0F, CU_STREAM_WAIT_VALUE_EQ);
+			cudaMemcpyAsync(dst_d + 3 * sliceSizeInWords, src_d + 3 * sliceSizeInWords, sliceSizeInBytes, cudaMemcpyDeviceToDevice);
+			
+			cuStreamWaitValue32(NULL, addr, 0x1F, CU_STREAM_WAIT_VALUE_EQ);
+			cudaMemcpyAsync(dst_d + 4 * sliceSizeInWords, src_d + 4 * sliceSizeInWords, sliceSizeInBytes, cudaMemcpyDeviceToDevice);
+			
+			cuStreamWaitValue32(NULL, addr, 0x3F, CU_STREAM_WAIT_VALUE_EQ);
+			cudaMemcpyAsync(dst_d + 5 * sliceSizeInWords, src_d + 5 * sliceSizeInWords, sliceSizeInBytes, cudaMemcpyDeviceToDevice);
+			
+			cuStreamWaitValue32(NULL, addr, 0x7F, CU_STREAM_WAIT_VALUE_EQ);
+			cudaMemcpyAsync(dst_d + 6 * sliceSizeInWords, src_d + 6 * sliceSizeInWords, sliceSizeInBytes, cudaMemcpyDeviceToDevice);
+			
+			cuStreamWaitValue32(NULL, addr, 0xFF, CU_STREAM_WAIT_VALUE_EQ);
+			cudaMemcpyAsync(dst_d + 7 * sliceSizeInWords, src_d + 7 * sliceSizeInWords, sliceSizeInBytes, cudaMemcpyDeviceToDevice);
+			
+		}
+		usleep(100);
+	}
+}
+
 void initOpenGL(int argc, char **argv)
 {
 	glutInit(&argc, argv);
@@ -199,7 +267,7 @@ void initOpenGL(int argc, char **argv)
 	glutCreateWindow("Title");
 	glutDisplayFunc(display);
 	glutKeyboardFunc(onKeyboardPress);
-	gluOrtho2D(0, SURFACE_W, SURFACE_H, 0);
+	gluOrtho2D(0, GRAPHICS_W, GRAPHICS_H, 0);
 }
 
 void initPixelBuffer()
@@ -207,7 +275,7 @@ void initPixelBuffer()
 	// PBO are a "source" of a texture, its buffer data can be "unpacked" to texture.
 	glGenBuffers(1, &pbo);
 	glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo);
-	glBufferData(GL_PIXEL_UNPACK_BUFFER, SURFACE_SIZE * 4, NULL, GL_STREAM_DRAW);
+	glBufferData(GL_PIXEL_UNPACK_BUFFER, GRAPHICS_BUFFER_SIZE, NULL, GL_STREAM_DRAW);
 	
 	glGenTextures(1, &tex);
 	glBindTexture(GL_TEXTURE_2D, tex);
@@ -261,10 +329,16 @@ int main(int argc, char **argv)
 	cudaError_t test = cudaHostRegister(map_base, MAP_SIZE, cudaHostRegisterIoMemory);
 	fprintf(stderr, "cudaHostRegister: %s\n", cudaGetErrorString(test));
 	
+	int attrValue = 0;
+	cuDeviceGetAttribute(&attrValue, CU_DEVICE_ATTRIBUTE_CAN_USE_STREAM_MEM_OPS, 0);
+	printf("Support for CU_DEVICE_ATTRIBUTE_CAN_USE_STREAM_MEM_OPS: %d\n.", attrValue);
+	
+	std::thread scheduleThread(scheduleLoop);
+	
 #ifdef NV_BUILD_DGPU
-	ce = cudaMalloc(&src_d, SURFACE_SIZE * sizeof(*src_d));
+	ce = cudaMalloc(&src_d, STREAM_SIZE);
 #else
-	ce = cudaHostAlloc(&src_d, SURFACE_SIZE * sizeof(*src_d),
+	ce = cudaHostAlloc(&src_d, STREAM_SIZE,
 		cudaHostAllocDefault);
 #endif
 	if (ce != cudaSuccess) {
@@ -280,7 +354,7 @@ int main(int argc, char **argv)
 	}
 
 	pin_params_src.va = (__u64)src_d;
-	pin_params_src.size = SURFACE_SIZE * sizeof(*src_d);
+	pin_params_src.size = STREAM_SIZE;
 	ret = ioctl(fd, RDMA_IOC_PIN, &pin_params_src);
 	if (ret != 0) {
 		fprintf(stderr, "ioctl(RDMA_IOC_PIN src) failed: ret=%d errno=%d\n", ret, errno);
@@ -288,9 +362,9 @@ int main(int argc, char **argv)
 	}
 
 #ifdef NV_BUILD_DGPU
-	ce = cudaMalloc(&dst_d, SURFACE_SIZE * sizeof(*dst_d));
+	ce = cudaMalloc(&dst_d, STREAM_SIZE);
 #else
-	ce = cudaHostAlloc(&dst_d, SURFACE_SIZE * sizeof(*dst_d),
+	ce = cudaHostAlloc(&dst_d, STREAM_SIZE,
 		cudaHostAllocDefault);
 #endif
 	if (ce != cudaSuccess) {
@@ -306,7 +380,7 @@ int main(int argc, char **argv)
 	}
 
 	pin_params_dst.va = (__u64)dst_d;
-	pin_params_dst.size = SURFACE_SIZE * sizeof(*dst_d);
+	pin_params_dst.size = STREAM_SIZE;
 	ret = ioctl(fd, RDMA_IOC_PIN, &pin_params_dst);
 	if (ret != 0) {
 		fprintf(stderr, "ioctl(RDMA_IOC_PIN dst) failed: ret=%d errno=%d\n", ret, errno);
@@ -336,7 +410,7 @@ int main(int argc, char **argv)
 
 	dma_params.src = pin_params_src.handle;
 	dma_params.dst = pin_params_dst.handle;
-	dma_params.len = SURFACE_SIZE * sizeof(*src_d);
+	dma_params.len = STREAM_SIZE;
 	dma_params.flags = RDMA_H2C2H_DMA_FLAG_SRC_IS_CUDA |
 		RDMA_H2C2H_DMA_FLAG_DST_IS_CUDA;
 	ret = ioctl(fd, RDMA_IOC_H2C2H_DMA, &dma_params);
@@ -351,12 +425,12 @@ int main(int argc, char **argv)
 	 * it to the host for validation.
 	 */
 #ifdef NV_BUILD_DGPU
-	ce = cudaMallocHost(&dst_cpu, SURFACE_SIZE * sizeof(*dst_cpu), 0);
+	ce = cudaMallocHost(&dst_cpu, STREAM_SIZE, 0);
 	if (ce != cudaSuccess) {
 		fprintf(stderr, "cudaMallocHost(dst_cpu) failed\n");
 		return 1;
 	}
-	ce = cudaMemcpy(dst_cpu, dst_d, SURFACE_SIZE * sizeof(*dst_cpu), cudaMemcpyDeviceToHost);
+	ce = cudaMemcpy(dst_cpu, dst_d, STREAM_SIZE, cudaMemcpyDeviceToHost);
 	if (ce != cudaSuccess) {
 		fprintf(stderr, "cudaMemcpy() failed: %d\n", ce);
 		return 1;
