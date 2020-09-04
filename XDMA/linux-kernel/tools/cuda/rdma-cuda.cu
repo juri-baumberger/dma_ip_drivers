@@ -154,6 +154,7 @@ GLuint tex = 0;
 struct cudaGraphicsResource *cuda_pbo_resource;
 uint32_t *src_d, *dst_d;
 void *map_base;
+cudaStream_t stream1;
 
 void drawTexture()
 {
@@ -197,7 +198,32 @@ void onKeyboardPress(unsigned char key, int x, int y)
 	}
 }
 
+inline int getSlice(int index, int numDelay)
+{
+	int sliceIndex = index - numDelay;
+	if (sliceIndex < 0)
+	{
+		sliceIndex += NUM_SLICES;
+	}
+	return sliceIndex;
+}
+
+void scheduleFrame(CUdeviceptr addr)
+{
+	const uint32_t sliceSizeInBytes = STREAM_SIZE / NUM_SLICES;
+	const uint32_t sliceSizeInWords = sliceSizeInBytes / sizeof(uint32_t);
+		
+	for (int i = 0; i < NUM_SLICES; i++)
+	{
+		// Wait for counter being, 0x1, 0x3,...
+		cuStreamWaitValue32(stream1, addr, (1 << (i+1)) - 1, CU_STREAM_WAIT_VALUE_EQ);
+		// Read 1 slice behind, so slice 7 on 0x1, slice 0 on 0x3...
+		cudaMemcpyAsync(dst_d + getSlice(i, 0) * sliceSizeInWords, src_d + getSlice(i, 0) * sliceSizeInWords, sliceSizeInBytes, cudaMemcpyDeviceToDevice, stream1);
+	}
+}
+
 static int lastFrameSliceValue = 0;
+static bool alreadyScheduledWork = false;
 void scheduleLoop()
 {
 	cudaSetDevice(0);
@@ -209,50 +235,37 @@ void scheduleLoop()
 		printf("Err %d", cr);
 	}
 	CUdeviceptr addr = baseBarAddr + 0x60;
-	uint32_t sliceSizeInBytes = STREAM_SIZE / NUM_SLICES;
-	uint32_t sliceSizeInWords = sliceSizeInBytes / sizeof(uint32_t);
-		
+	
 	while (true)
 	{	
 		bool scheduleWork = false;
 		int frameSliceValue = *((uint32_t*)addr);
 		
-		if (lastFrameSliceValue > frameSliceValue)
+		bool sliceChanged = (lastFrameSliceValue != frameSliceValue);
+		if (sliceChanged)
 		{
-			if (frameSliceValue != 0)
+			if (frameSliceValue == 0xFF)
 			{
-				printf("Missed frame start: %0x, %0x\n", lastFrameSliceValue, frameSliceValue);
-			}	
-			scheduleWork = true;
+				//printf("Schedule at %d\n", frameSliceValue);
+				scheduleWork = true;
+				alreadyScheduledWork = true;
+			}
+			else if (!alreadyScheduledWork && (frameSliceValue < lastFrameSliceValue))
+			{
+				printf("Missed schedule at %d\n", frameSliceValue);
+				scheduleWork = true;
+				alreadyScheduledWork = true;
+			}
+			else
+			{
+				alreadyScheduledWork = false;
+			}
 		}
 		lastFrameSliceValue = frameSliceValue;
 		
 		if (scheduleWork)
 		{
-			cuStreamWaitValue32(NULL, addr, 0x01, CU_STREAM_WAIT_VALUE_EQ);
-			cudaMemcpyAsync(dst_d + 0 * sliceSizeInWords, src_d + 0 * sliceSizeInWords, sliceSizeInBytes, cudaMemcpyDeviceToDevice);
-			
-			cuStreamWaitValue32(NULL, addr, 0x03, CU_STREAM_WAIT_VALUE_EQ);
-			cudaMemcpyAsync(dst_d + 1 * sliceSizeInWords, src_d + 1 * sliceSizeInWords, sliceSizeInBytes, cudaMemcpyDeviceToDevice);
-			
-			cuStreamWaitValue32(NULL, addr, 0x07, CU_STREAM_WAIT_VALUE_EQ);
-			cudaMemcpyAsync(dst_d + 2 * sliceSizeInWords, src_d + 2 * sliceSizeInWords, sliceSizeInBytes, cudaMemcpyDeviceToDevice);
-			
-			cuStreamWaitValue32(NULL, addr, 0x0F, CU_STREAM_WAIT_VALUE_EQ);
-			cudaMemcpyAsync(dst_d + 3 * sliceSizeInWords, src_d + 3 * sliceSizeInWords, sliceSizeInBytes, cudaMemcpyDeviceToDevice);
-			
-			cuStreamWaitValue32(NULL, addr, 0x1F, CU_STREAM_WAIT_VALUE_EQ);
-			cudaMemcpyAsync(dst_d + 4 * sliceSizeInWords, src_d + 4 * sliceSizeInWords, sliceSizeInBytes, cudaMemcpyDeviceToDevice);
-			
-			cuStreamWaitValue32(NULL, addr, 0x3F, CU_STREAM_WAIT_VALUE_EQ);
-			cudaMemcpyAsync(dst_d + 5 * sliceSizeInWords, src_d + 5 * sliceSizeInWords, sliceSizeInBytes, cudaMemcpyDeviceToDevice);
-			
-			cuStreamWaitValue32(NULL, addr, 0x7F, CU_STREAM_WAIT_VALUE_EQ);
-			cudaMemcpyAsync(dst_d + 6 * sliceSizeInWords, src_d + 6 * sliceSizeInWords, sliceSizeInBytes, cudaMemcpyDeviceToDevice);
-			
-			cuStreamWaitValue32(NULL, addr, 0xFF, CU_STREAM_WAIT_VALUE_EQ);
-			cudaMemcpyAsync(dst_d + 7 * sliceSizeInWords, src_d + 7 * sliceSizeInWords, sliceSizeInBytes, cudaMemcpyDeviceToDevice);
-			
+			scheduleFrame(addr);
 		}
 		usleep(100);
 	}
@@ -332,6 +345,12 @@ int main(int argc, char **argv)
 	int attrValue = 0;
 	cuDeviceGetAttribute(&attrValue, CU_DEVICE_ATTRIBUTE_CAN_USE_STREAM_MEM_OPS, 0);
 	printf("Support for CU_DEVICE_ATTRIBUTE_CAN_USE_STREAM_MEM_OPS: %d\n.", attrValue);
+	
+	int lowPriority = 0;
+	int highPriority = 0;
+	cudaDeviceGetStreamPriorityRange(&lowPriority, &highPriority);
+	printf("Priorities: lowest %d highest %d\n.", lowPriority, highPriority);
+	cudaStreamCreateWithPriority(&stream1, cudaStreamNonBlocking, highPriority);
 	
 	std::thread scheduleThread(scheduleLoop);
 	
