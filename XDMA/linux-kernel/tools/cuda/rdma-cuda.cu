@@ -155,6 +155,7 @@ struct cudaGraphicsResource *cuda_pbo_resource;
 uint32_t *src_d, *dst_d;
 void *map_base;
 cudaStream_t stream1;
+cudaEvent_t completionEvent[NUM_SLICES];
 
 void drawTexture()
 {
@@ -217,15 +218,24 @@ void scheduleFrame(CUdeviceptr addr)
 	{
 		// Wait for counter being, 0x1, 0x3,...
 		cuStreamWaitValue32(stream1, addr, (1 << (i+1)) - 1, CU_STREAM_WAIT_VALUE_EQ);
+		cudaEventRecord(completionEvent[i], stream1);
 		// Read 1 slice behind, so slice 7 on 0x1, slice 0 on 0x3...
 		cudaMemcpyAsync(dst_d + getSlice(i, 0) * sliceSizeInWords, src_d + getSlice(i, 0) * sliceSizeInWords, sliceSizeInBytes, cudaMemcpyDeviceToDevice, stream1);
 	}
 }
 
-static int lastFrameSliceValue = 0;
-static bool alreadyScheduledWork = false;
+void sleepyWaitForEvent(cudaEvent_t& event)
+{
+	while (cudaEventQuery(event) != cudaSuccess)
+	{
+		usleep(100);
+	}
+}
+
 void scheduleLoop()
 {
+	// Blocking doesn't seem to work and still eats 100% CPU
+	cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync);
 	cudaSetDevice(0);
 	
 	CUdeviceptr baseBarAddr;
@@ -236,38 +246,21 @@ void scheduleLoop()
 	}
 	CUdeviceptr addr = baseBarAddr + 0x60;
 	
+	// Schedule 1 frame ahead
+	scheduleFrame(addr);
+	
 	while (true)
 	{	
-		bool scheduleWork = false;
+		// Schedule full new frame after last slice
+		//cudaEventSynchronize(completionEvent[NUM_SLICES-1]);
+		sleepyWaitForEvent(completionEvent[NUM_SLICES-1]);
 		int frameSliceValue = *((uint32_t*)addr);
-		
-		bool sliceChanged = (lastFrameSliceValue != frameSliceValue);
-		if (sliceChanged)
+		if (frameSliceValue != 0xFF)
 		{
-			if (frameSliceValue == 0xFF)
-			{
-				//printf("Schedule at %d\n", frameSliceValue);
-				scheduleWork = true;
-				alreadyScheduledWork = true;
-			}
-			else if (!alreadyScheduledWork && (frameSliceValue < lastFrameSliceValue))
-			{
-				printf("Missed schedule at %d\n", frameSliceValue);
-				scheduleWork = true;
-				alreadyScheduledWork = true;
-			}
-			else
-			{
-				alreadyScheduledWork = false;
-			}
+			printf("Missed scheduling on last slice. Instead slice: %d/n", frameSliceValue);
 		}
-		lastFrameSliceValue = frameSliceValue;
 		
-		if (scheduleWork)
-		{
-			scheduleFrame(addr);
-		}
-		usleep(100);
+		scheduleFrame(addr);
 	}
 }
 
@@ -351,6 +344,11 @@ int main(int argc, char **argv)
 	cudaDeviceGetStreamPriorityRange(&lowPriority, &highPriority);
 	printf("Priorities: lowest %d highest %d\n.", lowPriority, highPriority);
 	cudaStreamCreateWithPriority(&stream1, cudaStreamNonBlocking, highPriority);
+	
+	for (auto iCompletionEvent = 0; iCompletionEvent < NUM_SLICES; iCompletionEvent++)
+	{
+		cudaEventCreate(&completionEvent[iCompletionEvent]);
+	}
 	
 	std::thread scheduleThread(scheduleLoop);
 	
