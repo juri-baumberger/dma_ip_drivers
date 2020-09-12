@@ -4,6 +4,7 @@ struct rdma_pin_cuda {
 	__u64 size;
 	/* Out */
 	__u32 handle;
+	__u64 startAddr;
 };
 
 struct rdma_unpin_cuda {

@@ -20,6 +20,8 @@ struct rdma_cuda_surface {
 	struct nvidia_p2p_page_table	*page_table;
 };
 
+struct idr indexPool;
+
 static void rdma_p2p_free_callback(void *data)
 {
 	struct rdma_cuda_surface *cusurf = data;
@@ -55,14 +57,43 @@ static int rdma_ioctl_pin_cuda(struct xdma_cdev *xcdev, unsigned long arg)
 		return ret;
 	}
 	
+	// create handle for pinned memory, used later for unpinning
+	cusurf->handle = idr_alloc(&indexPool, cusurf, 0, 0, GFP_KERNEL);
+	pin_params.handle = cusurf->handle;
+	
 	printk(KERN_INFO "CUDA PIN PageTable Entries %d, Size %d, physical addresses:\n", cusurf->page_table->entries, cusurf->page_table->page_size);
 	int numEntries = cusurf->page_table->entries;
 	if (numEntries > 0)
 	{
+	    pin_params.startAddr = cusurf->page_table->pages[0]->physical_address;
 	    printk(KERN_INFO "Pinned memory starting at physical address 0x%llx \n", cusurf->page_table->pages[0]->physical_address);
 	}
 	
+	if (copy_to_user(argp, &pin_params, sizeof(pin_params)))
+		return -EFAULT;
+	
 	return 0;
+}
+
+static int rdma_ioctl_unpin_cuda(struct xdma_cdev *xcdev, unsigned long arg)
+{
+	printk(KERN_INFO "RDMA IOCTL UNPIN CUDA\n");
+	void __user *argp = (void __user *)arg;
+	struct rdma_unpin_cuda unpin_params;
+	struct rdma_cuda_surface *cusurf;
+	
+	if (copy_from_user(&unpin_params, argp, sizeof(unpin_params)))
+		return -EFAULT;
+		
+	cusurf = idr_find(&indexPool, unpin_params.handle);
+	if (!cusurf) {
+		return -EINVAL;
+	}
+	
+	idr_remove(&indexPool, unpin_params.handle);
+	cusurf->handle = -1;
+	
+	nvidia_p2p_put_pages(0, 0, cusurf->va, cusurf->page_table);
 }
 
 static long rdma_fops_unlocked_ioctl(struct file *filep, unsigned int cmd, unsigned long arg)
@@ -77,6 +108,8 @@ static long rdma_fops_unlocked_ioctl(struct file *filep, unsigned int cmd, unsig
 	switch (cmd) {
 	case RDMA_IOC_PIN:
 		return rdma_ioctl_pin_cuda(xcdev, arg);
+	case RDMA_IOC_UNPIN:
+		return rdma_ioctl_unpin_cuda(xcdev, arg);
 	default:
 		return -EINVAL;
 	}
@@ -96,6 +129,7 @@ void cdev_rdma_init(struct xdma_cdev *xcdev)
 {
 	int result;
 	
+	idr_init(&indexPool);
 	cdev_init(&xcdev->cdev, &ctrl_fops);
 	result = pcie_set_readrq(xcdev->xpdev->pdev, 1024);
 	printk(KERN_INFO "Set XDMA PCI max read to 1024. Res %d\n", result);
