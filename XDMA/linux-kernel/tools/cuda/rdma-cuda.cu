@@ -156,6 +156,7 @@ uint32_t *src_d, *dst_d;
 void *map_base;
 cudaStream_t stream1;
 cudaEvent_t completionEvent[NUM_SLICES];
+cudaEvent_t newFrameEvent;
 
 void drawTexture()
 {
@@ -222,14 +223,8 @@ void scheduleFrame(CUdeviceptr addr)
 		// Read 1 slice behind, so slice 7 on 0x1, slice 0 on 0x3...
 		cudaMemcpyAsync(dst_d + getSlice(i, 0) * sliceSizeInWords, src_d + getSlice(i, 0) * sliceSizeInWords, sliceSizeInBytes, cudaMemcpyDeviceToDevice, stream1);
 	}
-}
-
-void sleepyWaitForEvent(cudaEvent_t& event)
-{
-	while (cudaEventQuery(event) != cudaSuccess)
-	{
-		usleep(100);
-	}
+	cuStreamWaitValue32(stream1, addr, 0x0, CU_STREAM_WAIT_VALUE_EQ);
+	cudaEventRecord(newFrameEvent, stream1);
 }
 
 void scheduleLoop()
@@ -252,14 +247,14 @@ void scheduleLoop()
 	while (true)
 	{	
 		// Schedule full new frame after last slice
-		//cudaEventSynchronize(completionEvent[NUM_SLICES-1]);
-		sleepyWaitForEvent(completionEvent[NUM_SLICES-1]);
-		int frameSliceValue = *((uint32_t*)addr);
+		cudaEventSynchronize(completionEvent[NUM_SLICES-1]);
+		/*
+		uint32_t frameSliceValue = *((volatile uint32_t*)addr);
 		if (frameSliceValue != 0xFF)
 		{
-			printf("Missed scheduling on last slice. Instead slice: %d/n", frameSliceValue);
+			printf("Missed scheduling on last slice. Instead slice: %d\n", frameSliceValue);
 		}
-		
+		*/
 		scheduleFrame(addr);
 	}
 }
@@ -318,7 +313,7 @@ int main(int argc, char **argv)
 		perror("open() failed");
 		return 1;
 	}
-	
+
 	int fd_xdma;
 	off_t target_page_offset = 0x0;
 	if ((fd_xdma = open("/dev/xdma1_user", O_RDWR | O_SYNC)) == -1)
@@ -347,8 +342,9 @@ int main(int argc, char **argv)
 	
 	for (auto iCompletionEvent = 0; iCompletionEvent < NUM_SLICES; iCompletionEvent++)
 	{
-		cudaEventCreate(&completionEvent[iCompletionEvent]);
+		cudaEventCreateWithFlags(&completionEvent[iCompletionEvent], cudaEventBlockingSync);
 	}
+	cudaEventCreateWithFlags(&newFrameEvent, cudaEventBlockingSync);
 	
 	std::thread scheduleThread(scheduleLoop);
 	
