@@ -154,7 +154,7 @@ GLuint tex = 0;
 struct cudaGraphicsResource *cuda_pbo_resource;
 uint32_t *src_d, *dst_d;
 void *map_base;
-cudaStream_t stream1;
+cudaStream_t fpgaStream, primaryStream;
 cudaEvent_t completionEvent[NUM_SLICES];
 cudaEvent_t newFrameEvent;
 
@@ -212,19 +212,25 @@ inline int getSlice(int index, int numDelay)
 
 void scheduleFrame(CUdeviceptr addr)
 {
-	const uint32_t sliceSizeInBytes = STREAM_SIZE / NUM_SLICES;
-	const uint32_t sliceSizeInWords = sliceSizeInBytes / sizeof(uint32_t);
-		
+	cuStreamWaitValue32(fpgaStream, addr, 0x0, CU_STREAM_WAIT_VALUE_EQ);
+	cudaEventRecord(newFrameEvent, fpgaStream);
 	for (int i = 0; i < NUM_SLICES; i++)
 	{
 		// Wait for counter being, 0x1, 0x3,...
-		cuStreamWaitValue32(stream1, addr, (1 << (i+1)) - 1, CU_STREAM_WAIT_VALUE_EQ);
-		cudaEventRecord(completionEvent[i], stream1);
-		// Read 1 slice behind, so slice 7 on 0x1, slice 0 on 0x3...
-		cudaMemcpyAsync(dst_d + getSlice(i, 0) * sliceSizeInWords, src_d + getSlice(i, 0) * sliceSizeInWords, sliceSizeInBytes, cudaMemcpyDeviceToDevice, stream1);
+		cuStreamWaitValue32(fpgaStream, addr, (1 << (i+1)) - 1, CU_STREAM_WAIT_VALUE_EQ);
+		cudaEventRecord(completionEvent[i], fpgaStream);
 	}
-	cuStreamWaitValue32(stream1, addr, 0x0, CU_STREAM_WAIT_VALUE_EQ);
-	cudaEventRecord(newFrameEvent, stream1);
+	
+	const uint32_t sliceSizeInBytes = STREAM_SIZE / NUM_SLICES;
+	const uint32_t sliceSizeInWords = sliceSizeInBytes / sizeof(uint32_t);
+		
+	cudaStreamWaitEvent(primaryStream, newFrameEvent, 0);
+	for (int i = 0; i < NUM_SLICES; i++)
+	{
+		cudaStreamWaitEvent(primaryStream, completionEvent[i], 0);
+		// Read 1 slice behind, so slice 7 on 0x1, slice 0 on 0x3...
+		cudaMemcpyAsync(dst_d + getSlice(i, 0) * sliceSizeInWords, src_d + getSlice(i, 0) * sliceSizeInWords, sliceSizeInBytes, cudaMemcpyDeviceToDevice, primaryStream);
+	}
 }
 
 void scheduleLoop()
@@ -266,7 +272,7 @@ void initOpenGL(int argc, char **argv)
 	glutInitWindowSize(2160, 2160);
 	glutInitWindowPosition(100, 100);
 	glutCreateWindow("Title");
-	glutDisplayFunc(display);
+	//glutDisplayFunc(display);
 	glutKeyboardFunc(onKeyboardPress);
 	gluOrtho2D(0, GRAPHICS_W, GRAPHICS_H, 0);
 }
@@ -338,7 +344,8 @@ int main(int argc, char **argv)
 	int highPriority = 0;
 	cudaDeviceGetStreamPriorityRange(&lowPriority, &highPriority);
 	printf("Priorities: lowest %d highest %d\n.", lowPriority, highPriority);
-	cudaStreamCreateWithPriority(&stream1, cudaStreamNonBlocking, highPriority);
+	cudaStreamCreateWithPriority(&fpgaStream, cudaStreamNonBlocking, highPriority);
+	cudaStreamCreateWithPriority(&primaryStream, cudaStreamNonBlocking, highPriority);
 	
 	for (auto iCompletionEvent = 0; iCompletionEvent < NUM_SLICES; iCompletionEvent++)
 	{
